@@ -160,6 +160,52 @@ This is specifically about **connectivity** (links) and **visibility** (indexing
 
 ---
 
+## AI Search Non-Negotiables (post-publish gates)
+
+Per [Google's AI Optimization Guide](https://developers.google.com/search/docs/fundamentals/ai-optimization-guide),
+just being indexed isn't enough — content must be **eligible for snippets**
+to surface in AI Overviews and AI Mode. This skill verifies that bar after
+publish. If any of these fail, the page is reported as a problem (not just
+"indexed" but "indexed AND snippet-eligible").
+
+### Snippet-eligibility checks
+
+1. **No `nosnippet` directive** — the rendered page must NOT contain
+   `<meta name="robots" content="...nosnippet...">` or `data-nosnippet`
+   attributes on the main content. If present, fail with reason
+   `snippet_blocked_by_directive`.
+2. **No `max-snippet:0`** — must NOT have `max-snippet:0` in the robots
+   meta. `max-snippet:-1` or no limit is required for AI eligibility.
+3. **No `noindex`** — already covered by L08 in audit-content; double-check
+   here as a hard gate. If present, the page is invisible to AI Search.
+4. **Schema is valid JSON-LD** — fetch the rendered HTML, parse all
+   `<script type="application/ld+json">` blocks, verify each parses. Invalid
+   JSON-LD means schema isn't read by Google → no rich result eligibility.
+5. **Canonical URL matches the current URL** — if canonical points elsewhere,
+   the page won't be the AI-citation target. Already checked by audit-content
+   L04, replicated here as a release gate.
+6. **Crawlable from a starting point** — verify the page is reachable from
+   the sitemap AND from at least one internal link refreshed in Step 2.
+   Orphan pages may be indexed but rarely cited.
+
+### Indexing follow-through
+
+7. **Submit to GSC Indexing API** — current behaviour (Step 3) stays.
+8. **Verify indexed within 7 days** — re-check via GSC `urlInspection`
+   after submission. If still not indexed, flag for manual review.
+9. **Record indexing latency** — log time from publish → first appearance
+   in GSC. Useful baseline data when AI surfaces tag new content.
+
+### Why these matter for AI Search
+
+Google's guide is explicit: pages must "be indexed and eligible for snippets
+in regular Google Search" before they can appear in AI experiences.
+Indexability is the floor, but **snippet-eligibility is the actual gate**.
+A page can be indexed and still excluded from AI answers if any of these
+checks fail.
+
+---
+
 ## Dependencies
 
 - Node.js v24+ (native fetch, no npm packages)
