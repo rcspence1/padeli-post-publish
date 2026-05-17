@@ -105,6 +105,120 @@ function apiRequest(url, accessToken, body) {
 // ---------------------------------------------------------------------------
 
 /**
+ * BPA publish-readiness check.
+ *
+ * Verifies the minimum non-negotiables a published listing must have for
+ * BPA gold-standard quality. If any blocker is present, post-publish skips
+ * link refresh + indexing — forces the operator to fix the listing first.
+ *
+ * Checks (listings only):
+ *   1. Featured image set (featured_media !== 0)
+ *   2. Hero hook present (_coaches_tab_short_description ≥ 10 chars)
+ *   3. Opening hours cover all 7 days (parsed from _opening_hours)
+ *   4. Booking link (if present) returns HTTP 200-399 — no 404s
+ *   5. Title doesn't have placeholder leaks ({venue_name}, etc.)
+ *   6. At least 6 gallery images
+ *
+ * @param {object} post - WP post object (with .meta populated, context=edit)
+ * @returns {Promise<{ready: boolean, blockers: string[], checked: number}>}
+ */
+async function publishReadinessCheck(post) {
+  const blockers = [];
+  const meta = post.meta || {};
+  let checked = 0;
+
+  // 1. Featured image
+  checked++;
+  if (!post.featured_media || post.featured_media === 0) {
+    blockers.push('No featured image set — listing card will show map placeholder, OG shares have no thumbnail');
+  }
+
+  // 2. Hero hook
+  checked++;
+  const hero = (meta._coaches_tab_short_description || '').trim();
+  if (hero.length < 10) {
+    blockers.push(`Hero hook missing or too short (${hero.length} chars) — title will render without a description underneath`);
+  }
+
+  // 3. Opening hours — all 7 days
+  checked++;
+  const hours = (meta._opening_hours || '').trim();
+  if (!hours) {
+    blockers.push('Opening hours empty — opening times table will not render');
+  } else {
+    const ALL_DAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+    const covered = new Set();
+    for (const entry of hours.split(',').map(s => s.trim())) {
+      const m = entry.match(/^(Mon|Tue|Wed|Thu|Fri|Sat|Sun)(?:-(Mon|Tue|Wed|Thu|Fri|Sat|Sun))?\b/);
+      if (!m) continue;
+      const a = ALL_DAYS.indexOf(m[1]);
+      const b = m[2] ? ALL_DAYS.indexOf(m[2]) : a;
+      for (let i = a; i <= b && i >= 0; i++) covered.add(ALL_DAYS[i]);
+    }
+    const missing = ALL_DAYS.filter(d => !covered.has(d));
+    if (missing.length > 0) {
+      blockers.push(`Opening hours missing days: ${missing.join(', ')} — table will render incomplete`);
+    }
+  }
+
+  // 4. Booking link HEAD check
+  checked++;
+  const bookingUrl = (meta._booking_link || meta._direct_booking_url || meta._playtomic_url || '').trim();
+  if (bookingUrl && /^https?:\/\//.test(bookingUrl)) {
+    const live = await headCheckOk(bookingUrl);
+    if (!live) {
+      blockers.push(`Booking link returns 404 or unreachable: ${bookingUrl}`);
+    }
+  }
+
+  // 5. Placeholder leaks in title
+  checked++;
+  const title = (post.title?.rendered || post.title || '').replace(/<[^>]*>/g, '');
+  if (/\{[a-z_]+\}/i.test(title) || /\bUNKNOWN\b/i.test(title) || /\bnull\b/i.test(title)) {
+    blockers.push(`Title contains placeholder leak: "${title}"`);
+  }
+
+  // 6. Gallery has at least 6 images (warning-level BPA standard)
+  checked++;
+  const gallery = meta._gallery || {};
+  const galleryCount = typeof gallery === 'object' && gallery !== null ? Object.keys(gallery).length : 0;
+  if (galleryCount > 0 && galleryCount < 6) {
+    blockers.push(`Gallery has only ${galleryCount} images (BPA standard: 6+)`);
+  } else if (galleryCount === 0) {
+    blockers.push('Gallery is empty — no images for visitors to browse');
+  }
+
+  return { ready: blockers.length === 0, blockers, checked };
+}
+
+/**
+ * Minimal HTTP HEAD check returning true if the URL responds with 2xx-3xx.
+ */
+function headCheckOk(url, timeoutMs = 5000) {
+  return new Promise((resolve) => {
+    try {
+      const u = new URL(url);
+      const lib = u.protocol === 'https:' ? require('https') : require('http');
+      const req = lib.request({
+        method: 'HEAD',
+        hostname: u.hostname,
+        port: u.port || (u.protocol === 'https:' ? 443 : 80),
+        path: u.pathname + u.search,
+        timeout: timeoutMs,
+        headers: { 'User-Agent': 'Mozilla/5.0 (PadeliPipeline)' },
+      }, (res) => {
+        resolve(res.statusCode >= 200 && res.statusCode < 400);
+      });
+      req.on('error', () => resolve(false));
+      req.on('timeout', () => { req.destroy(); resolve(false); });
+      req.end();
+    } catch {
+      resolve(false);
+    }
+  });
+}
+
+/**
  * Resolve a WP post by URL or numeric ID.
  * Checks both /wp/v2/posts and /wp/v2/job-listings (listing CPT).
  *
@@ -260,7 +374,7 @@ async function submitForIndexing(url) {
  * @param {string|number} urlOrId - WP post URL or ID
  * @returns {Promise<object>} Results object
  */
-async function postPublishSingle(urlOrId) {
+async function postPublishSingle(urlOrId, opts = {}) {
   const warnings = [];
   console.log(`\n[post-publish] ========================================`);
   console.log(`[post-publish] Starting post-publish for: ${urlOrId}`);
@@ -280,6 +394,32 @@ async function postPublishSingle(urlOrId) {
   const postTitle = (post.title?.rendered || post.title || '').replace(/<[^>]*>/g, '');
   console.log(`[post-publish] Resolved: "${postTitle}" (ID: ${post.id})`);
   console.log(`[post-publish] URL: ${postUrl}`);
+
+  // 1b. BPA publish-readiness gate
+  // Refuses to refresh links / request indexing on a post that fails the
+  // BPA non-negotiables. Forces the operator to fix the listing before
+  // post-publish work is "wasted" on a sub-standard page.
+  // Override with opts.skipReadinessCheck = true.
+  if (!opts.skipReadinessCheck && post.type === 'listing') {
+    console.log('\n[post-publish] Step 1b: BPA publish-readiness check...');
+    const readiness = await publishReadinessCheck(post);
+    if (!readiness.ready) {
+      console.log(`[post-publish] ⛔ NOT PUBLISH-READY (${readiness.blockers.length} blockers):`);
+      for (const b of readiness.blockers) console.log(`  - ${b}`);
+      console.log('\n[post-publish] Skipping link refresh + indexing. Fix the blockers above, then re-run.');
+      console.log('[post-publish] (override with --skip-readiness if you really need to proceed)');
+      return {
+        url: postUrl,
+        title: postTitle,
+        postId: post.id,
+        readiness: { ready: false, blockers: readiness.blockers },
+        linksAdded: { outbound: 0, inbound: 0 },
+        indexing: { status: 'BLOCKED_BY_READINESS_CHECK' },
+        warnings: [`Halted by publish-readiness check: ${readiness.blockers.length} blockers`],
+      };
+    }
+    console.log(`[post-publish] ✓ Publish-ready (${readiness.checked} non-negotiables verified)`);
+  }
 
   // 2. Refresh page index
   console.log('\n[post-publish] Step 2: Refreshing page index...');
@@ -472,9 +612,10 @@ async function postPublishBatch(options = {}) {
   let pendingIndex = 0;
   let submitted = 0;
 
+  const skipReadinessCheck = options.skipReadinessCheck === true;
   for (const id of postIds) {
     try {
-      const result = await postPublishSingle(id);
+      const result = await postPublishSingle(id, { skipReadinessCheck });
       results.push(result);
       totalLinksAdded += (result.linksAdded.inbound + result.linksAdded.outbound);
       if (result.indexing.status === 'INDEXED') indexed++;
@@ -528,10 +669,12 @@ async function main() {
     process.exit(1);
   }
 
+  const skipReadinessCheck = args.includes('--skip-readiness');
+
   if (command === 'single') {
     const target = args[1];
     if (!target) { console.log('Error: provide a URL or post ID'); process.exit(1); }
-    const result = await postPublishSingle(target);
+    const result = await postPublishSingle(target, { skipReadinessCheck });
     console.log('\nResult:', JSON.stringify(result, null, 2));
 
   } else if (command === 'batch') {
@@ -585,5 +728,7 @@ module.exports = {
   checkIndexStatus,
   submitForIndexing,
   resolvePost,
+  publishReadinessCheck,
+  headCheckOk,
   getAccessToken,
 };

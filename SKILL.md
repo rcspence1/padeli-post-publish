@@ -62,6 +62,31 @@ Determine the mode from the user's message:
 - "all XX" (country code) -> batch by country
 - "check URL" -> indexing check only
 
+### Step 1b: BPA Publish-Readiness Gate (listings only)
+
+Before any post-publish work runs on a listing, verify the listing meets the
+BPA gold-standard non-negotiables. If it fails, **halt** — don't refresh
+links, don't request indexing. Surface the blockers so the operator can fix
+the listing before re-running.
+
+**Non-negotiables checked:**
+
+1. **Featured image set** — `featured_media !== 0`
+2. **Hero hook present** — `_coaches_tab_short_description` ≥ 10 chars
+3. **Opening hours cover all 7 days** — parsed from `_opening_hours` with
+   range-expansion (`Mon-Fri 06:00-23:00` is recognised as covering all
+   weekdays)
+4. **Booking link works** — HTTP HEAD check on `_booking_link` returns
+   200-399 (skipped if no booking link)
+5. **No placeholder leaks in title** — no `{venue_name}`, no `UNKNOWN`,
+   no `null`
+6. **Gallery has ≥ 6 images** (BPA standard)
+
+Override with `--skip-readiness` if you really need to publish a sub-standard
+listing (rare — usually means data is genuinely unavailable).
+
+Blog posts skip this check.
+
 ### Step 2: Refresh Page Index
 
 Always run this first — it rebuilds the link graph from all published content:
