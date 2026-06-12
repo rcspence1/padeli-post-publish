@@ -743,13 +743,16 @@ function proposeRegionHubLinks(newPost, regionHubs, corpus) {
       const g = inferGeo(p);
       return g.city === geo.city && (!geo.cc || g.cc === geo.cc);
     });
-    let added = 0;
+    // Link EVERY same-city club not already body-linked (no 2-club cap — decision
+    // 2026-06-12: a city guide should point at all real venues in that city).
+    // Order deterministically by title so output is stable across runs.
+    const titleOf = (p) =>
+      (p.title?.rendered ? stripHtml(p.title.rendered) : (p.title || p.slug || '')).toLowerCase();
+    cityClubs.sort((a, b) => titleOf(a).localeCompare(titleOf(b)));
     for (const club of cityClubs) {
-      if (added >= 2) break;
       const clubUrl = club.link || `/${club.slug}/`;
       if (bodyLinksToUrl(body, clubUrl)) continue;
       proposals.push(buildFlagshipClubProposal(newPost, club, body));
-      added++;
     }
   }
 
@@ -781,10 +784,45 @@ function bodyLinksToUrl(body, url) {
   return false;
 }
 
+/**
+ * Title-case a place / phrase for anchor text.
+ * Capitalises each word's first letter, but keeps common small words
+ * (in, of, the, and, on, at, by, for, to) lowercase UNLESS they are the
+ * first word. Hyphenated/multi-word cities (e.g. "milton keynes",
+ * "stoke-on-trent") are handled per token. Already-correct casing is
+ * preserved for tokens that are not all-lowercase (e.g. acronyms).
+ *
+ * @param {string} str
+ * @returns {string}
+ */
+function titleCasePhrase(str) {
+  if (!str) return '';
+  const small = new Set(['in', 'of', 'the', 'and', 'on', 'at', 'by', 'for', 'to', 'a', 'an']);
+  const capWord = (w) =>
+    w
+      .split('-')
+      .map((part) => (part ? part.charAt(0).toUpperCase() + part.slice(1) : part))
+      .join('-');
+  const words = str.trim().split(/\s+/);
+  return words
+    .map((w, i) => {
+      const lower = w.toLowerCase();
+      // Keep small words lowercase unless first word.
+      if (i !== 0 && small.has(lower)) return lower;
+      // Preserve tokens that already carry internal capitals (e.g. acronyms / "McLaren").
+      if (w !== lower) return w;
+      return capWord(lower);
+    })
+    .join(' ');
+}
+
 /** Build a proposal: blog → region hub. */
 function buildHubProposal(newPost, hub, body) {
   const newTitle = newPost.title?.rendered ? stripHtml(newPost.title.rendered) : (newPost.title || '');
-  const anchor = `padel clubs in ${hub.name}`;
+  // Title-case the anchor so it reads like every other (title-cased) link in the
+  // body, e.g. "Padel Clubs in Sheffield" / "Padel Clubs in Milton Keynes" — not the
+  // old lowercase "padel clubs in Sheffield". Target URL (hub.url) is unchanged.
+  const anchor = `Padel Clubs in ${titleCasePhrase(hub.name)}`;
   return {
     existing_post: {
       id: newPost.id,
