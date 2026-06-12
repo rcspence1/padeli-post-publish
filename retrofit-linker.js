@@ -883,15 +883,50 @@ async function fetchPostBySlug(slug) {
  * 3. Replace the first occurrence of the anchor text with the linked version
  * 4. PUT the updated content back to WP
  *
+ * SAFETY GATE (2026-06-12): writes are auto-applied ONLY when the edit-target page
+ * (proposal.existing_post — the page that RECEIVES the link) is a BLOG post
+ * (post_type === 'post'). Listing writes are DEFERRED by default because this engine
+ * PUTs via the raw wpPut() helper, which does NOT carry the Listeo meta-wipe protection
+ * that wp-payload.js applies (Listeo's save_post hook silently strips LISTEO_PROTECTED
+ * meta on any bulk content write — see ~/Projects/padeli-notion/lib/wp-payload.js and
+ * LINKING-ARCHITECTURE-DECISION-2026-06-12.md). The listing-write path is preserved but
+ * gated behind options.allowListingWrites === true (default false).
+ *
  * @param {object[]} approvedProposals - Proposals with status 'approved'
- * @param {object} options
- * @returns {Promise<object[]>} Results array with { proposal, success, error? }
+ * @param {object} [options]
+ * @param {boolean} [options.allowListingWrites=false] - Permit writes to `listing` CPT
+ *   pages. Leave false unless the caller has applied Listeo meta-wipe protection.
+ * @returns {Promise<object[]>} Results array with { proposal, success, error? }.
+ *   The array carries a non-enumerable-friendly `deferred` property and a
+ *   `deferredListingWrites` count for listing proposals that were skipped.
  */
-async function applyProposals(approvedProposals) {
+async function applyProposals(approvedProposals, options = {}) {
+  const allowListingWrites = options.allowListingWrites === true;
   const results = [];
+  const deferred = [];
+  let deferredListingWrites = 0;
 
   for (const proposal of approvedProposals) {
     try {
+      // SAFETY GATE: existing_post is the page being WRITTEN to (the link is inserted
+      // into ITS body — verified in generateProposal/buildHubProposal/buildFlagshipClubProposal,
+      // where existing_post is always the edit target). If that target is a `listing`,
+      // defer unless explicitly allowed — the raw wpPut() here lacks Listeo meta-wipe
+      // protection (LISTEO_PROTECTED) that wp-payload.js provides.
+      if (proposal.existing_post.post_type === 'listing' && !allowListingWrites) {
+        deferredListingWrites++;
+        const entry = {
+          proposal,
+          reason: 'listing write deferred — needs LISTEO_PROTECTED meta-wipe protection per wp-payload.js; see LINKING-ARCHITECTURE-DECISION-2026-06-12.md',
+        };
+        deferred.push(entry);
+        results.push({ proposal, success: false, deferred: true, error: entry.reason });
+        console.log(
+          `[retrofit-linker] DEFERRED listing write → "${proposal.existing_post.title}" (id ${proposal.existing_post.id}); needs Listeo meta-wipe protection`
+        );
+        continue;
+      }
+
       // Route to the correct CPT endpoint: 'post' -> /wp/v2/posts/{id}, 'listing' -> /wp/v2/listing/{id}.
       // Previously hardcoded to /posts/, so any listing→listing or post→listing retrofit silently failed.
       const ept = (proposal.existing_post.post_type === 'listing') ? 'listing' : 'posts';
@@ -958,6 +993,13 @@ async function applyProposals(approvedProposals) {
         `[retrofit-linker] Failed to apply proposal for post ${proposal.existing_post.id}: ${err.message}`
       );
     }
+  }
+
+  // Surface deferred listing writes to the caller (count + collected entries with reasons).
+  results.deferred = deferred;
+  results.deferredListingWrites = deferredListingWrites;
+  if (deferredListingWrites > 0) {
+    console.log(`[retrofit-linker] Deferred ${deferredListingWrites} listing write(s) — re-run with allowListingWrites once Listeo meta-wipe protection is in place`);
   }
 
   return results;
@@ -1220,9 +1262,9 @@ async function retrofitLinks(newPostSlug, options = {}) {
     console.log(`[retrofit-linker] Report saved: ${reportPath}`);
   } else if (toApply.length > 0) {
     console.log(`[retrofit-linker] Applying ${toApply.length} approved proposals...`);
-    applied = await applyProposals(toApply);
+    applied = await applyProposals(toApply, { allowListingWrites: options.allowListingWrites === true });
     const successCount = applied.filter((r) => r.success).length;
-    console.log(`[retrofit-linker] Applied ${successCount}/${toApply.length} proposals`);
+    console.log(`[retrofit-linker] Applied ${successCount}/${toApply.length} proposals (deferred listing writes: ${applied.deferredListingWrites || 0})`);
   } else {
     console.log('[retrofit-linker] No approved proposals to apply — review report and approve proposals first');
     const reportPath = saveProposalReport(report, newPostSlug);
