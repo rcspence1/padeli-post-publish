@@ -19,6 +19,109 @@ const { POST_TYPES } = require('./config');
 const { countWords, stripHtml, slugify, normalise } = require('./utils');
 
 // ---------------------------------------------------------------------------
+// Geo inference (city / country / region)
+//
+// Padeli URLs are geo-nested: /clubs/{cc}/{city}/{slug}/, /coaching/{cc}/{city}/...,
+// /tournaments/{cc}/{city}/...  and the region hubs themselves are /clubs/{cc}/{city}/.
+// A blog about "best padel in Dubai" should prefer Dubai listings + the Dubai hub —
+// so we extract {cc, city} from whatever signal a page carries (URL first, then meta,
+// then slug/title). Accuracy-first: we only assert geo we can actually read; never invent.
+// ---------------------------------------------------------------------------
+
+/**
+ * Pull a {cc, city} pair out of a geo-nested padeli URL.
+ * Matches /{section}/{cc}/{city}/...  where section ∈ clubs|coaching|tournaments
+ * and cc is a 2-letter country code. Returns {} if the URL is not geo-nested.
+ *
+ * @param {string} url - Full or relative padeli URL
+ * @returns {{cc?: string, city?: string}}
+ */
+function geoFromUrl(url) {
+  if (!url) return {};
+  const path = String(url).replace(/^https?:\/\/[^/]+/, '');
+  const m = path.match(/^\/(?:clubs|coaching|tournaments)\/([a-z]{2})\/([a-z0-9-]+)\//i);
+  if (!m) return {};
+  return { cc: m[1].toLowerCase(), city: m[2].toLowerCase() };
+}
+
+/**
+ * Best-effort geo for any page: URL first (most reliable), then meta, then slug.
+ * city is returned as a normalised slug ("abu-dhabi") AND a spaced form for text matching.
+ *
+ * @param {object} page - WP post/listing OR a page_index entry
+ * @returns {{cc: string, city: string, cityText: string}}
+ */
+function inferGeo(page) {
+  if (!page) return { cc: '', city: '', cityText: '' };
+  const meta = page.meta || {};
+
+  // 1. URL (page.link from WP REST, or page.url from page_index)
+  const fromUrl = geoFromUrl(page.link || page.url || '');
+  let cc = fromUrl.cc || '';
+  let city = fromUrl.city || '';
+
+  // 2. Meta fallbacks (only if URL gave nothing)
+  if (!cc) cc = String(meta.country_code || meta._country_code || '').toLowerCase();
+  if (!city) {
+    const mCity = meta.city || meta._city || meta._geolocation_city || '';
+    if (mCity) city = slugify(String(mCity));
+  }
+
+  // 3. Slug fallback for BLOG posts (their URL is flat, e.g.
+  //    /best-padel-courts-brighton-2026/). Published blogs carry no city meta, so the
+  //    slug is the only geo signal. We extract a city slug here; it only becomes a real
+  //    match downstream if a region hub / listing actually shares that city slug — so
+  //    no invented geo leaks through (accuracy-first).
+  if (!city) {
+    const slugCity = cityFromSlug(page.slug || '');
+    if (slugCity) city = slugCity;
+  }
+
+  const cityText = city ? city.replace(/-/g, ' ') : '';
+  return { cc, city, cityText };
+}
+
+/**
+ * Extract a city slug from a blog slug using the known city URL patterns.
+ * Mirrors the patterns in extractKeyTerms.
+ *
+ * @param {string} slug
+ * @returns {string} city slug (e.g. "brighton", "canary-wharf") or ''
+ */
+function cityFromSlug(slug) {
+  if (!slug) return '';
+  const patterns = [
+    /best-padel-(?:courts|clubs|centres|centers)-(.+?)(?:-\d{4})?$/,
+    /padel-(?:courts|clubs|centres|centers)-(?:in-)?(.+?)(?:-\d{4})?$/,
+    /where-to-play-padel-(?:in-)?(.+?)(?:-\d{4})?$/,
+    /^padel-in-(.+?)(?:-\d{4})?$/,
+  ];
+  for (const p of patterns) {
+    const m = slug.match(p);
+    if (m && m[1]) {
+      const c = m[1].replace(/^-+|-+$/g, '');
+      // Guard against country-level / generic suffixes that aren't cities.
+      if (c && !['uk', 'usa', 'us', 'gb', 'ae', 'uae'].includes(c)) return c;
+    }
+  }
+  return '';
+}
+
+/**
+ * True if the two pages resolve to the same city (preferred) or, failing a
+ * city match, the same country. Used as the geo signal in classifyRelationship.
+ *
+ * @returns {'city'|'country'|'none'}
+ */
+function geoMatchLevel(a, b) {
+  const ga = inferGeo(a);
+  const gb = inferGeo(b);
+  if (ga.city && gb.city && ga.city === gb.city) return 'city';
+  if (ga.cc && gb.cc && ga.cc === gb.cc) return 'country';
+  return 'none';
+}
+
+// ---------------------------------------------------------------------------
 // Key term extraction
 // ---------------------------------------------------------------------------
 
@@ -145,6 +248,20 @@ function classifyRelationship(newPost, existingPost) {
     if (newSlugWords.has(w)) overlap++;
   }
   if (overlap >= 2) return 'topical';
+
+  // Geo signal (added 2026-06-12 per LINKING-ARCHITECTURE-DECISION):
+  // a same-city pair (e.g. a "best padel in Dubai" blog and a Dubai listing/blog)
+  // is topically related even with no shared pillar/category/tag/slug words.
+  // Same-country is a weaker signal — only treat as topical when at least one side
+  // is a blog post (city/country guides are the pages that legitimately round up
+  // many venues); listing↔listing same-country is left to Listeo's nearby widget.
+  const geo = geoMatchLevel(newPost, existingPost);
+  if (geo === 'city') return 'topical';
+  if (geo === 'country') {
+    const newType = newPost.type || newPost.post_type || '';
+    const existType = existingPost.type || existingPost.post_type || '';
+    if (newType === 'post' || existType === 'post') return 'topical';
+  }
 
   return 'none';
 }
@@ -412,12 +529,15 @@ function generateProposal(existingPost, opportunity, newPost) {
       slug: existingPost.slug,
       title: existingTitle,
       url: `/${existingPost.slug}/`,
+      // CPT routing — 'post' or 'listing'. WP REST returns `type` on every item.
+      post_type: existingPost.type || existingPost.post_type || 'post',
     },
     new_post: {
       id: newPost.id,
       slug: newPost.slug,
       title: newTitle,
       url: newUrl,
+      post_type: newPost.type || newPost.post_type || 'post',
     },
     relationship,
     opportunity: {
@@ -447,10 +567,20 @@ function generateProposal(existingPost, opportunity, newPost) {
 function scanCorpus(newPost, corpus) {
   const proposals = [];
 
+  const newType = newPost.type || newPost.post_type || 'post';
+
   for (const existingPost of corpus) {
     // Never link a post to itself
     if (existingPost.id === newPost.id) continue;
     if (existingPost.slug === newPost.slug) continue;
+
+    // listing → listing body links are OWNED by Listeo's "Other Clubs Near Me"
+    // widget (rendered on every listing). Adding them here = the overlap/divergence
+    // the linking decision explicitly forbids. The engine's listing-facing job is
+    // INBOUND (blog/hub → listing) + listing → blog/hub — never listing → listing.
+    // (LINKING-ARCHITECTURE-DECISION-2026-06-12, item 3.)
+    const existType = existingPost.type || existingPost.post_type || 'post';
+    if (newType === 'listing' && existType === 'listing') continue;
 
     // Check if it already links to the new post
     const body = existingPost.content?.rendered || existingPost.content || '';
@@ -496,33 +626,247 @@ function scanCorpus(newPost, corpus) {
  */
 async function fetchCorpus(options = {}) {
   const perPage = options.perPage || 100;
-  let page = 1;
-  let allPosts = [];
-
-  while (true) {
-    const batch = await wpGet(
-      `/wp-json/wp/v2/posts?per_page=${perPage}&page=${page}&status=publish`
-    );
-    if (!Array.isArray(batch) || batch.length === 0) break;
-    allPosts = allPosts.concat(batch);
-    if (batch.length < perPage) break;
-    page++;
+  const cpts = ['posts', 'listing']; // both /posts (blog) AND /listing (CPT) are link targets/sources
+  let all = [];
+  for (const cpt of cpts) {
+    let page = 1;
+    while (true) {
+      const batch = await wpGet(
+        `/wp-json/wp/v2/${cpt}?per_page=${perPage}&page=${page}&status=publish`
+      );
+      if (!Array.isArray(batch) || batch.length === 0) break;
+      // Ensure each item carries its type so applyProposals / generateProposal can route writes
+      for (const it of batch) { if (!it.type) it.type = (cpt === 'posts' ? 'post' : 'listing'); }
+      all = all.concat(batch);
+      if (batch.length < perPage) break;
+      page++;
+    }
   }
-
-  return allPosts;
+  return all;
 }
 
 /**
- * Fetch a single post by slug.
+ * Fetch region-hub pages as link targets.
+ *
+ * Region hubs are a `region` taxonomy ARCHIVE (not a CPT), so they never appear
+ * in fetchCorpus. Each term's `link` field is already the live hub URL
+ * (e.g. /clubs/ae/dubai/). We keep only CITY-level hubs (path /clubs/{cc}/{city}/,
+ * i.e. 2 segments after /clubs/) because those are the pages a city blog should
+ * point at; country-level hubs (/clubs/gb/) are too broad for a per-city link.
+ *
+ * Returns lightweight hub objects shaped like link targets:
+ *   { id, name, slug, cc, city, count, url, type:'region-hub' }
+ *
+ * @param {object} [options]
+ * @param {number} [options.perPage=100]
+ * @returns {Promise<object[]>}
+ */
+async function fetchRegionHubs(options = {}) {
+  const perPage = options.perPage || 100;
+  const hubs = [];
+  let page = 1;
+  while (true) {
+    let batch;
+    try {
+      batch = await wpGet(
+        `/wp-json/wp/v2/region?per_page=${perPage}&page=${page}&hide_empty=true&_fields=id,name,slug,count,link,parent`
+      );
+    } catch {
+      break; // taxonomy unavailable / paged past the end
+    }
+    if (!Array.isArray(batch) || batch.length === 0) break;
+    for (const t of batch) {
+      const g = geoFromUrl(t.link || '');
+      // Keep only city-level hubs (both cc AND city present in the URL).
+      if (!g.cc || !g.city) continue;
+      hubs.push({
+        id: t.id,
+        name: t.name,
+        slug: t.slug,
+        cc: g.cc,
+        city: g.city,
+        count: t.count || 0,
+        url: t.link,
+        type: 'region-hub',
+      });
+    }
+    if (batch.length < perPage) break;
+    page++;
+  }
+  return hubs;
+}
+
+/**
+ * Build region-hub link proposals for a newly published BLOG post.
+ *
+ * A city/country guide (a /posts/ page) should point at the matching region hub
+ * (topical authority) plus 1–2 flagship clubs in that city (specificity). This is
+ * the blog → region-hub + flagship-club rule from the linking decision.
+ *
+ * We do NOT generate these for listings — a listing's nearby-club links are owned
+ * by Listeo's widget, and a listing already sits under its region hub.
+ *
+ * @param {object} newPost - The newly published page (must be a blog post to qualify)
+ * @param {object[]} regionHubs - From fetchRegionHubs()
+ * @param {object[]} corpus - Full corpus (to pick flagship clubs in the same city)
+ * @returns {object[]} Proposal objects (existing_post = the blog being edited)
+ */
+function proposeRegionHubLinks(newPost, regionHubs, corpus) {
+  const newType = newPost.type || newPost.post_type || 'post';
+  if (newType !== 'post') return []; // region-hub linking is a blog-only job
+
+  const geo = inferGeo(newPost);
+  if (!geo.city && !geo.cc) return [];
+
+  const body = newPost.content?.rendered || newPost.content?.raw || newPost.content || '';
+  const proposals = [];
+
+  // 1. The matching city hub (preferred). Dedup by the hub's exact URL only —
+  //    NOT by the bare city slug (a city blog's body is full of /clubs/{cc}/{city}/...
+  //    listing links that share the slug, which would falsely mark the hub "already linked").
+  let hub = null;
+  if (geo.city) hub = regionHubs.find((h) => h.city === geo.city && (!geo.cc || h.cc === geo.cc));
+  if (hub && !bodyLinksToUrl(body, hub.url)) {
+    proposals.push(buildHubProposal(newPost, hub, body));
+  }
+
+  // 2. One or two flagship CLUBS in the same city (highest-signal venues).
+  //    Restricted to /clubs/ listings — the `listing` CPT also holds coaches
+  //    (/coaching/...), which are NOT clubs and must not be sold as "flagship clubs".
+  //    Dedup by exact listing URL.
+  if (geo.city) {
+    const cityClubs = corpus.filter((p) => {
+      const t = p.type || p.post_type || '';
+      if (t !== 'listing') return false;
+      const url = p.link || p.url || '';
+      if (!/\/clubs\//.test(url)) return false; // clubs only — exclude coaches
+      const g = inferGeo(p);
+      return g.city === geo.city && (!geo.cc || g.cc === geo.cc);
+    });
+    let added = 0;
+    for (const club of cityClubs) {
+      if (added >= 2) break;
+      const clubUrl = club.link || `/${club.slug}/`;
+      if (bodyLinksToUrl(body, clubUrl)) continue;
+      proposals.push(buildFlagshipClubProposal(newPost, club, body));
+      added++;
+    }
+  }
+
+  return proposals;
+}
+
+/**
+ * True if the body already has an <a href> pointing at EXACTLY this URL.
+ * Matches the href as a complete attribute value (with/without trailing slash,
+ * absolute or path-relative) — a substring check would wrongly flag a hub URL
+ * like /clubs/gb/sheffield/ as "linked" just because a deeper listing URL
+ * (/clubs/gb/sheffield/some-club/) contains it.
+ */
+function bodyLinksToUrl(body, url) {
+  if (!body || !url) return false;
+  const pathOnly = String(url).replace(/^https?:\/\/[^/]+/, '');
+  const variants = new Set();
+  for (const u of [url, pathOnly]) {
+    if (!u) continue;
+    const noSlash = u.replace(/\/$/, '');
+    variants.add(`href="${u}"`);
+    variants.add(`href="${noSlash}"`);
+    variants.add(`href='${u}'`);
+    variants.add(`href='${noSlash}'`);
+  }
+  for (const v of variants) {
+    if (body.includes(v)) return true;
+  }
+  return false;
+}
+
+/** Build a proposal: blog → region hub. */
+function buildHubProposal(newPost, hub, body) {
+  const newTitle = newPost.title?.rendered ? stripHtml(newPost.title.rendered) : (newPost.title || '');
+  const anchor = `padel clubs in ${hub.name}`;
+  return {
+    existing_post: {
+      id: newPost.id,
+      slug: newPost.slug,
+      title: newTitle,
+      url: `/${newPost.slug}/`,
+      post_type: 'post',
+    },
+    new_post: {
+      id: hub.id,
+      slug: hub.slug,
+      title: hub.name,
+      url: hub.url,
+      post_type: 'region-hub',
+    },
+    relationship: 'region-hub',
+    opportunity: {
+      paragraph_index: -1,
+      sentence: '',
+      suggested_anchor: anchor,
+      suggested_insert: `<a href="${hub.url}">${anchor}</a>`,
+      context: `Blog "${newTitle}" → region hub ${hub.url} (${hub.count} clubs)`,
+    },
+    confidence: 'high',
+    reason: `City/country guide should link to its region hub (${hub.count} clubs) for topical authority`,
+    status: 'proposed',
+    _link_target: 'related-reading', // appended to Related Reading, not inlined mid-sentence
+  };
+}
+
+/** Build a proposal: blog → flagship club listing in the same city. */
+function buildFlagshipClubProposal(newPost, club, body) {
+  const newTitle = newPost.title?.rendered ? stripHtml(newPost.title.rendered) : (newPost.title || '');
+  const clubTitle = club.title?.rendered ? stripHtml(club.title.rendered) : (club.title || club.slug);
+  const clubUrl = club.link || `/${club.slug}/`;
+  return {
+    existing_post: {
+      id: newPost.id,
+      slug: newPost.slug,
+      title: newTitle,
+      url: `/${newPost.slug}/`,
+      post_type: 'post',
+    },
+    new_post: {
+      id: club.id,
+      slug: club.slug,
+      title: clubTitle,
+      url: clubUrl,
+      post_type: 'listing',
+    },
+    relationship: 'region-flagship',
+    opportunity: {
+      paragraph_index: -1,
+      sentence: '',
+      suggested_anchor: clubTitle,
+      suggested_insert: `<a href="${clubUrl}">${clubTitle}</a>`,
+      context: `Blog "${newTitle}" → flagship club ${clubUrl}`,
+    },
+    confidence: 'medium',
+    reason: `Same-city flagship club — specificity link from the city guide to a real venue`,
+    status: 'proposed',
+    _link_target: 'related-reading',
+  };
+}
+
+/**
+ * Fetch a single post by slug. Checks /posts first, then /listing — the CPT is
+ * embedded in the response's `type` field so callers can route writes.
  *
  * @param {string} slug
  * @returns {Promise<object|null>}
  */
 async function fetchPostBySlug(slug) {
-  const results = await wpGet(
-    `/wp-json/wp/v2/posts?slug=${encodeURIComponent(slug)}&status=publish`
-  );
-  if (Array.isArray(results) && results.length > 0) return results[0];
+  const enc = encodeURIComponent(slug);
+  for (const cpt of ['posts', 'listing']) {
+    const results = await wpGet(`/wp-json/wp/v2/${cpt}?slug=${enc}&status=publish`);
+    if (Array.isArray(results) && results.length > 0) {
+      const hit = results[0];
+      if (!hit.type) hit.type = (cpt === 'posts' ? 'post' : 'listing');
+      return hit;
+    }
+  }
   return null;
 }
 
@@ -548,19 +892,20 @@ async function applyProposals(approvedProposals) {
 
   for (const proposal of approvedProposals) {
     try {
+      // Route to the correct CPT endpoint: 'post' -> /wp/v2/posts/{id}, 'listing' -> /wp/v2/listing/{id}.
+      // Previously hardcoded to /posts/, so any listing→listing or post→listing retrofit silently failed.
+      const ept = (proposal.existing_post.post_type === 'listing') ? 'listing' : 'posts';
+      const base = `/wp-json/wp/v2/${ept}/${proposal.existing_post.id}`;
+
       // Fetch fresh content
-      const post = await wpGet(
-        `/wp-json/wp/v2/posts/${proposal.existing_post.id}`
-      );
+      const post = await wpGet(base);
       let content = post.content?.rendered || post.content?.raw || '';
 
       // If WP returns rendered content, we need the raw version
       // Try fetching with context=edit for raw content
       let rawContent;
       try {
-        const editPost = await wpGet(
-          `/wp-json/wp/v2/posts/${proposal.existing_post.id}?context=edit`
-        );
+        const editPost = await wpGet(`${base}?context=edit`);
         rawContent = editPost.content?.raw || content;
       } catch {
         rawContent = content;
@@ -568,10 +913,23 @@ async function applyProposals(approvedProposals) {
 
       const anchor = proposal.opportunity.suggested_anchor;
       const insert = proposal.opportunity.suggested_insert;
+      const targetUrl = proposal.new_post.url || '';
 
-      // Find and replace the anchor text — only the first unlinked occurrence
-      // Ensure we don't replace text that's already inside a link
-      const replaced = replaceUnlinkedText(rawContent, anchor, insert);
+      let replaced;
+      if (proposal._link_target === 'related-reading') {
+        // Region-hub / flagship-club links append to a Related Reading list rather
+        // than splice mid-sentence (there's no natural anchor in the body). Idempotent:
+        // skip if the target URL is already linked anywhere in the post.
+        if (bodyLinksToUrl(rawContent, targetUrl)) {
+          results.push({ proposal, success: false, error: `Already links to ${targetUrl}` });
+          continue;
+        }
+        replaced = appendRelatedReadingItem(rawContent, insert);
+      } else {
+        // Find and replace the anchor text — only the first unlinked occurrence
+        // Ensure we don't replace text that's already inside a link
+        replaced = replaceUnlinkedText(rawContent, anchor, insert);
+      }
 
       if (replaced === rawContent) {
         results.push({
@@ -583,9 +941,7 @@ async function applyProposals(approvedProposals) {
       }
 
       // Update the post
-      await wpPut(`/wp-json/wp/v2/posts/${proposal.existing_post.id}`, {
-        content: replaced,
-      });
+      await wpPut(base, { content: replaced });
 
       proposal.status = 'applied';
       results.push({ proposal, success: true });
@@ -605,6 +961,48 @@ async function applyProposals(approvedProposals) {
   }
 
   return results;
+}
+
+/**
+ * Append a link as a Related Reading list item.
+ *
+ * If the post already has a "Related Reading" <ul>, the new <li> is inserted before
+ * its closing </ul>. Otherwise a fresh Gutenberg Related Reading block is appended at
+ * the end. Used for region-hub / flagship-club links that have no inline anchor.
+ *
+ * @param {string} html - Post body HTML
+ * @param {string} linkHtml - The <a href=...>...</a> to add
+ * @returns {string} Updated HTML
+ */
+function appendRelatedReadingItem(html, linkHtml) {
+  const item = `<li>${linkHtml}</li>`;
+
+  // Case 1: a Related Reading list already exists → insert before its </ul>.
+  const headingIdx = html.search(/Related Reading/i);
+  if (headingIdx !== -1) {
+    const ulOpen = html.indexOf('<ul', headingIdx);
+    if (ulOpen !== -1) {
+      const ulClose = html.indexOf('</ul>', ulOpen);
+      if (ulClose !== -1) {
+        return html.slice(0, ulClose) + item + '\n' + html.slice(ulClose);
+      }
+    }
+  }
+
+  // Case 2: no Related Reading section → append a fresh block.
+  const section = [
+    '',
+    '<!-- wp:heading {"level":2} -->',
+    '<h2 class="wp-block-heading">Related Reading</h2>',
+    '<!-- /wp:heading -->',
+    '',
+    '<!-- wp:list -->',
+    '<ul class="wp-block-list">',
+    item,
+    '</ul>',
+    '<!-- /wp:list -->',
+  ].join('\n');
+  return html + '\n' + section + '\n';
 }
 
 /**
@@ -694,10 +1092,17 @@ function buildProposalReport(proposals, meta = {}) {
     lines.push('');
 
     for (const proposal of group) {
+      const isRegion = proposal.relationship === 'region-hub' || proposal.relationship === 'region-flagship';
       lines.push(`### ${counter}. ${proposal.existing_post.title} (${proposal.existing_post.url})`);
+      lines.push(`**Direction:** ${isRegion ? 'OUTBOUND (this page → target)' : 'INBOUND (this page → new page)'}`);
       lines.push(`**Relationship:** ${proposal.relationship}`);
+      lines.push(`**Target:** ${proposal.new_post.title} (${proposal.new_post.url})`);
       lines.push(`**Reason:** ${proposal.reason}`);
-      lines.push(`**Sentence:** "${proposal.opportunity.sentence}"`);
+      if (proposal.opportunity.sentence) {
+        lines.push(`**Sentence:** "${proposal.opportunity.sentence}"`);
+      } else {
+        lines.push(`**Placement:** Related Reading list`);
+      }
       lines.push(`**Suggested anchor:** "${proposal.opportunity.suggested_anchor}"`);
       lines.push(`**Insert:** \`${proposal.opportunity.suggested_insert}\``);
       lines.push('');
@@ -742,12 +1147,14 @@ function saveProposalReport(report, slug) {
  * @param {object} [options]
  * @param {object} [options.newPost] - Pre-fetched new post (skips WP fetch)
  * @param {object[]} [options.corpus] - Pre-fetched corpus (skips WP fetch)
+ * @param {object[]} [options.regionHubs] - Pre-fetched region hubs (skips WP fetch)
  * @param {object[]} [options.approvedProposals] - Pre-approved proposals to apply
+ * @param {boolean} [options.dryRun] - Build/return proposals but NEVER write to WP
  * @returns {Promise<{proposals: object[], applied: object[], report: string}>}
  */
 async function retrofitLinks(newPostSlug, options = {}) {
   console.log(`[retrofit-linker] Starting retrofit scan for: ${newPostSlug}`);
-  console.log('[retrofit-linker] Mode: LIVE');
+  console.log(`[retrofit-linker] Mode: ${options.dryRun ? 'DRY-RUN (no writes)' : 'LIVE'}`);
 
   // 1. Fetch the new post
   let newPost = options.newPost || null;
@@ -767,19 +1174,51 @@ async function retrofitLinks(newPostSlug, options = {}) {
   }
   console.log(`[retrofit-linker] Corpus: ${corpus.length} published posts`);
 
-  // 3. Scan corpus for opportunities
+  // 2b. Fetch region hubs (taxonomy archives — not in the corpus).
+  let regionHubs = options.regionHubs || null;
+  if (!regionHubs) {
+    console.log('[retrofit-linker] Fetching region hubs...');
+    regionHubs = await fetchRegionHubs(options);
+  }
+  console.log(`[retrofit-linker] Region hubs: ${regionHubs.length} city-level`);
+
+  // 3. Scan corpus for INBOUND opportunities (existing pages → new page)
   console.log('[retrofit-linker] Scanning corpus for mention opportunities...');
-  const proposals = scanCorpus(newPost, corpus);
-  console.log(`[retrofit-linker] Found ${proposals.length} proposals`);
+  const inbound = scanCorpus(newPost, corpus);
+
+  // 3b. Region-hub + flagship-club OUTBOUND links (new BLOG → hub + clubs).
+  //     No-op for listings (their nearby links are Listeo-owned).
+  const regionProposals = proposeRegionHubLinks(newPost, regionHubs, corpus);
+  if (regionProposals.length > 0) {
+    console.log(`[retrofit-linker] Region-hub/flagship proposals: ${regionProposals.length}`);
+  }
+
+  const proposals = [...inbound, ...regionProposals];
+  console.log(`[retrofit-linker] Found ${proposals.length} proposals (${inbound.length} inbound, ${regionProposals.length} region)`);
 
   // 4. Build report
   const report = buildProposalReport(proposals, { corpusSize: corpus.length });
 
-  // 5. Apply pre-approved proposals
+  // 5. Auto-approve high + medium confidence; low stays 'proposed' for manual review.
+  // (Spec: SKILLS-SPEC §5 Tier-1 #2a, 2026-05-27.) Reviewers can still downgrade or
+  // skip via the saved report when running review mode.
+  for (const p of proposals) {
+    if ((p.confidence === 'high' || p.confidence === 'medium') && p.status === 'proposed') {
+      p.status = 'approved';
+    }
+  }
+  const autoApprovedCount = proposals.filter(p => p.status === 'approved' && p.confidence !== 'low').length;
+  if (autoApprovedCount > 0) console.log(`[retrofit-linker] Auto-approved ${autoApprovedCount} high+medium-confidence proposals`);
+
+  // 6. Apply pre-approved proposals (unless dry-run)
   let applied = [];
   const toApply = options.approvedProposals || proposals.filter((p) => p.status === 'approved');
 
-  if (toApply.length > 0) {
+  if (options.dryRun) {
+    console.log(`[retrofit-linker] DRY-RUN — ${toApply.length} proposals would be applied; NO writes performed`);
+    const reportPath = saveProposalReport(report, newPostSlug);
+    console.log(`[retrofit-linker] Report saved: ${reportPath}`);
+  } else if (toApply.length > 0) {
     console.log(`[retrofit-linker] Applying ${toApply.length} approved proposals...`);
     applied = await applyProposals(toApply);
     const successCount = applied.filter((r) => r.success).length;
@@ -801,10 +1240,16 @@ module.exports = {
   retrofitLinks,
   scanCorpus,
   fetchCorpus,
+  fetchRegionHubs,
+  proposeRegionHubLinks,
+  fetchPostBySlug,
   findMentionOpportunities,
   generateProposal,
   applyProposals,
   buildProposalReport,
   saveProposalReport,
   classifyRelationship,
+  inferGeo,
+  geoFromUrl,
+  geoMatchLevel,
 };

@@ -332,36 +332,17 @@ async function checkIndexStatus(url) {
  * @returns {Promise<object>} { submitted: true/false, message }
  */
 async function submitForIndexing(url) {
-  let accessToken;
-  try {
-    accessToken = await getAccessToken();
-  } catch {
-    return { submitted: false, message: 'OAuth token refresh failed — re-run gsc-oauth-setup.js' };
-  }
-  if (!accessToken) {
-    return { submitted: false, message: 'GSC not configured — run gsc-oauth-setup.js first' };
-  }
-
-  try {
-    const { statusCode, data } = await apiRequest(
-      'https://indexing.googleapis.com/v3/urlNotifications:publish',
-      accessToken,
-      { url, type: 'URL_UPDATED' }
-    );
-
-    if (statusCode === 200) {
-      return { submitted: true, message: `Submitted — notifyTime: ${data.urlNotificationMetadata?.latestUpdate?.notifyTime || 'ok'}` };
-    }
-
-    // 403 typically means Indexing API not enabled or URL not verified
-    if (statusCode === 403) {
-      return { submitted: false, message: 'Indexing API not enabled or site not verified — enable via GCP console' };
-    }
-
-    return { submitted: false, message: `Indexing API returned ${statusCode}: ${JSON.stringify(data).slice(0, 200)}` };
-  } catch (err) {
-    return { submitted: false, message: `Indexing submission failed: ${err.message}` };
-  }
+  // The Google Indexing API only accepts JobPosting / BroadcastEvent — it
+  // silently ignores listing/post pages (confirmed; cf. SKILLS-SPEC §5 #3 +
+  // §6 Recommendation B, 2026-05-27). Indexing for padeli.com is handled by:
+  // XML sitemap (Yoast/theme, auto) + GSC URL Inspection + manual Request-
+  // Indexing in the GSC UI. Status checks via gsc-index-status-checker.py.
+  // Until consolidated, this submit is intentionally a no-op so the post-
+  // publish flow doesn't burn API quota on the wrong tool.
+  return {
+    submitted: false,
+    message: 'Indexing-API submit skipped (wrong tool for listings/posts). XML sitemap auto-updates; use GSC URL Inspection / gsc-index-status-checker.py for status; manual Request-Indexing in GSC UI for urgency.',
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -444,11 +425,14 @@ async function postPublishSingle(urlOrId, opts = {}) {
     const inboundProposals = scanCorpus(post, corpus);
     console.log(`[post-publish] Inbound link proposals found: ${inboundProposals.length}`);
 
-    if (inboundProposals.length > 0) {
-      // Auto-approve and apply proposals
-      const result = await retrofitLinks(slug, { newPost: post, corpus });
-      const appliedCount = (result.applied || []).filter(r => r.success).length;
-      linksAdded.inbound = appliedCount;
+    // Auto-approve and apply proposals (retrofitLinks also adds region-hub /
+    // flagship-club outbound links for blog posts). dryRun => report only, no writes.
+    const result = await retrofitLinks(slug, { newPost: post, corpus, dryRun: opts.dryRun });
+    const appliedCount = (result.applied || []).filter(r => r.success).length;
+    linksAdded.inbound = appliedCount;
+    if (opts.dryRun) {
+      console.log(`[post-publish] DRY-RUN — ${result.proposals.length} proposals generated, 0 written`);
+    } else {
       console.log(`[post-publish] Inbound links applied: ${appliedCount}`);
     }
 
@@ -613,9 +597,10 @@ async function postPublishBatch(options = {}) {
   let submitted = 0;
 
   const skipReadinessCheck = options.skipReadinessCheck === true;
+  const dryRun = options.dryRun === true;
   for (const id of postIds) {
     try {
-      const result = await postPublishSingle(id, { skipReadinessCheck });
+      const result = await postPublishSingle(id, { skipReadinessCheck, dryRun });
       results.push(result);
       totalLinksAdded += (result.linksAdded.inbound + result.linksAdded.outbound);
       if (result.indexing.status === 'INDEXED') indexed++;
@@ -660,7 +645,7 @@ async function main() {
 
   if (!command) {
     console.log('Usage:');
-    console.log('  node lib/post-publish.js single <url_or_id>');
+    console.log('  node lib/post-publish.js single <url_or_id> [--dry-run]');
     console.log('  node lib/post-publish.js batch --since 2026-05-15');
     console.log('  node lib/post-publish.js batch --country AE');
     console.log('  node lib/post-publish.js batch --ids 123,456,789');
@@ -670,11 +655,12 @@ async function main() {
   }
 
   const skipReadinessCheck = args.includes('--skip-readiness');
+  const dryRun = args.includes('--dry-run');
 
   if (command === 'single') {
     const target = args[1];
     if (!target) { console.log('Error: provide a URL or post ID'); process.exit(1); }
-    const result = await postPublishSingle(target, { skipReadinessCheck });
+    const result = await postPublishSingle(target, { skipReadinessCheck, dryRun });
     console.log('\nResult:', JSON.stringify(result, null, 2));
 
   } else if (command === 'batch') {
@@ -682,7 +668,7 @@ async function main() {
     const value = args[2];
     if (!flag || !value) { console.log('Error: provide --since, --country, or --ids'); process.exit(1); }
 
-    let options = {};
+    let options = { dryRun };
     if (flag === '--since') options.since = value;
     else if (flag === '--country') options.country = value;
     else if (flag === '--ids') options.ids = value.split(',').map(Number);

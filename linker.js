@@ -20,7 +20,25 @@ const { slugify, countWords } = require('./utils');
 // Constants
 // ---------------------------------------------------------------------------
 
-const DEFAULT_INDEX_PATH = path.resolve(__dirname, '..', 'data', 'page_index.json');
+// Resolve the page index location with this priority:
+//   1. PADELI_PAGE_INDEX_PATH env var (explicit override)
+//   2. In-repo: ../data/page_index.json
+//   3. PADELI_PROJECT_DIR/data/page_index.json (the rebuild target; padeli-notion)
+// Falls back to the in-repo path even if missing so callers get a clear ENOENT.
+function resolveDefaultIndexPath() {
+  if (process.env.PADELI_PAGE_INDEX_PATH) return process.env.PADELI_PAGE_INDEX_PATH;
+  const inRepo = path.resolve(__dirname, '..', 'data', 'page_index.json');
+  if (fs.existsSync(inRepo)) return inRepo;
+  if (process.env.PADELI_PROJECT_DIR) {
+    const fromMain = path.resolve(process.env.PADELI_PROJECT_DIR, 'data', 'page_index.json');
+    if (fs.existsSync(fromMain)) {
+      console.log(`[linker] page_index.json not in this repo — using ${fromMain}`);
+      return fromMain;
+    }
+  }
+  return inRepo;
+}
+const DEFAULT_INDEX_PATH = resolveDefaultIndexPath();
 
 /**
  * Map postType_tier combos to funnel positions.
